@@ -83,14 +83,11 @@ def soft_box(x, lo, hi, margin):
     )
 
 
-def identify_cortical_shell(cortex_candidate: np.ndarray, solid_bool: np.ndarray) -> np.ndarray:
-    """
-    Identify the main connected cortical shell by:
-    1. Finding the largest connected component of high-confidence cortex
-    2. Preserving this as the 'true' cortical shell
-
-    This prevents isolated high-density trabecular voxels from being classified as cortex.
-    """
+def identify_cortical_shell(
+    cortex_candidate: np.ndarray,
+    solid_bool: np.ndarray,
+    min_component_size: int = 3000,
+) -> np.ndarray:
     struct_6 = ndi.generate_binary_structure(3, 1)
     labeled, n = ndi.label(cortex_candidate, structure=struct_6)
 
@@ -100,14 +97,18 @@ def identify_cortical_shell(cortex_candidate: np.ndarray, solid_bool: np.ndarray
     sizes = np.bincount(labeled.ravel())
     sizes[0] = 0
 
-    if sizes.size == 0:
-        return cortex_candidate
+    keep_labels = np.where(sizes >= min_component_size)[0]
 
-    largest_label = np.argmax(sizes)
-    cortical_shell = labeled == largest_label
+    if keep_labels.size == 0:
+        largest_label = np.argmax(sizes)
+        cortical_shell = labeled == largest_label
+        print(f"No cortical components >= {min_component_size} voxels; keeping largest only.")
+    else:
+        cortical_shell = np.isin(labeled, keep_labels)
 
-    print(f"Identified cortical shell with {int(cortical_shell.sum())} voxels")
-    print(f"Removed {int(cortex_candidate.sum()) - int(cortical_shell.sum())} isolated voxels")
+    print(f"Connected cortical components found: {n}")
+    print(f"Keeping {len(keep_labels)} cortical components >= {min_component_size} voxels")
+    print(f"Final cortical shell voxels kept: {int(cortical_shell.sum())}")
 
     return cortical_shell
 
@@ -123,13 +124,11 @@ def run_script_03(
         medullary_dilation_iterations: int = 2,
         min_cortex_voxels: int = 3000,
         pore_min_size: int = 20,
+        fill_unassigned: bool = True,
 ):
-
     specimen_id, pair_folder, abs_pair_path, abs_side_path = make_ids_and_paths(
         specimen_base, side
     )
-
-    # Rest of your code starts here...
 
     meta_path = find_meta(abs_side_path, specimen_id)
     with open(meta_path, "r") as f:
@@ -143,7 +142,7 @@ def run_script_03(
 
     print(
         "=== Script 03: cortex / trabecula segmentation "
-        "(density-based + connectivity-filtered) ==="
+        "(cortex-first + trabecular-density assignment) ==="
     )
     print(f"Specimen: {specimen_id}")
     print(f"mgHA file: {input_mgha}")
@@ -164,7 +163,7 @@ def run_script_03(
         raise ValueError("mgHA, band, and outer ring volumes must have the same shape.")
 
     band = band_raw > 0
-    outer = outer_raw > 0  # QC only
+    outer = outer_raw > 0
     print(f"Band voxels: {int(band.sum())}")
     print(f"Outer voxels (QC only): {int(outer.sum())}")
 
@@ -180,108 +179,121 @@ def run_script_03(
     solid_bool = solid_raw > 0
     print(f"Solid blob voxels: {int(solid_bool.sum())}")
 
-    bone_mask_for_thresholds = band
-
-    # Use GUI-provided values directly (no auto-detection)
     print(f"\nUsing density thresholds from GUI:")
     print(f"  Trab min: {trab_min}")
     print(f"  Cort min: {cort_min}")
     print(f"  Cort max: {cort_max}")
+    print(f"  Fill unassigned voxels: {fill_unassigned}")
 
     print("=== Hierarchical cortical / trabecular classification ===")
 
     # ============================================================================
-    # STEP 1: Identify candidate regions based on DENSITY ALONE (no geometry yet)
+    # STEP 1: Initial voxel assessment by density
     # ============================================================================
-    print("\n--- Density-based classification ---")
+    print("\n--- Initial voxel assessment by density ---")
 
-    # High-confidence cortical density
-    is_high_cort_density = (mg >= cort_min) & (mg <= cort_max)
+    is_high_cort_density = (mg >= cort_min) & (mg <= cort_max) & bone_mask
     high_cort_voxels = int(is_high_cort_density.sum())
     print(f"Voxels with cortical density ({cort_min:.1f}-{cort_max:.1f} mgHA): {high_cort_voxels}")
 
-    # High-confidence trabecular density
-    is_high_trab_density = (mg >= trab_min) & (mg < cort_min)
+    is_high_trab_density = (mg >= trab_min) & (mg < cort_min) & bone_mask
     high_trab_voxels = int(is_high_trab_density.sum())
     print(f"Voxels with trabecular density ({trab_min:.1f}-{cort_min:.1f} mgHA): {high_trab_voxels}")
 
-    # Gray zone (ambiguous density)
-    is_gray_zone = ~(is_high_cort_density | is_high_trab_density) & bone_mask
+    is_gray_zone = bone_mask & (~is_high_cort_density) & (~is_high_trab_density)
     gray_voxels = int(is_gray_zone.sum())
     print(f"Voxels in gray zone (ambiguous density): {gray_voxels}")
 
     # ============================================================================
-    # STEP 2: Apply GEOMETRY constraint - cortex must be in band
+    # STEP 2: Assign cortical voxels first
+    # Cortex only allowed in band and must pass connectivity filter
     # ============================================================================
-    print("\n--- Geometry constraint (cortical band) ---")
+    print("\n--- Cortical assignment first ---")
 
-    # Cortical candidates: in band + cortical density
-    cortex_candidate = is_high_cort_density & band & bone_mask
-    print(f"Cortical candidates (density + band + bone): {int(cortex_candidate.sum())}")
+    cortex_candidate = is_high_cort_density & band
+    print(f"Cortical candidates (cortical density + band): {int(cortex_candidate.sum())}")
 
-    # Trabecular candidates: in band + trabecular density
-    trab_candidate_in_band = is_high_trab_density & band & bone_mask
-    print(f"Trabecular in band (density + band + bone): {int(trab_candidate_in_band.sum())}")
+    is_cortex = identify_cortical_shell(
+        cortex_candidate,
+        solid_bool,
+        min_component_size=min_cortex_voxels,
+    )
 
-    # ============================================================================
-    # STEP 3: Filter cortex using CONNECTIVITY to remove isolated high-density voxels
-    # ============================================================================
-    print("\n--- Connectivity filtering (cortical shell identification) ---")
-
-    cortex_candidate_opened = ndi.binary_opening(cortex_candidate)
-    is_cortex = identify_cortical_shell(cortex_candidate_opened, solid_bool)
-
+    is_cortex &= band
     print(f"Cortical shell voxels (after connectivity filter): {int(is_cortex.sum())}")
 
     # ============================================================================
-    # STEP 4: Trabecular = everything else in bone (in band OR outside band)
+    # STEP 3: Assign trabecular voxels second
+    # trab voxel = trabecular density outside band
+    # plus trabecular density inside band if not cortical
     # ============================================================================
-    print("\n--- Trabecular assignment ---")
+    print("\n--- Trabecular assignment second ---")
 
-    # Start with all bone that's not cortex
-    is_trab = bone_mask & (~is_cortex)
+    trab_outside_band = is_high_trab_density & (~band)
+    trab_inside_band_not_cortex = is_high_trab_density & band & (~is_cortex)
+    is_trab = trab_outside_band | trab_inside_band_not_cortex
 
+    print(f"Trabecular voxels outside cortical band: {int(trab_outside_band.sum())}")
+    print(f"Trabecular voxels inside band (trab density, not cortex): {int(trab_inside_band_not_cortex.sum())}")
     print(f"Initial trabecular voxels: {int(is_trab.sum())}")
 
-    # Include high-density trabecular voxels that are in the band
-    # (They are allowed to exist in the cortical band if density is trabecular)
-    is_trab_in_band = is_trab & trab_candidate_in_band
-    print(f"Trabecular voxels in cortical band: {int(is_trab_in_band.sum())}")
+    # ============================================================================
+    # STEP 3b: Optional fill of remaining unassigned bone voxels
+    # Unassigned in band -> cortex
+    # Unassigned outside band -> trabecula
+    # ============================================================================
+    if fill_unassigned:
+        print("\n--- Filling unassigned bone voxels ---")
+        unassigned = bone_mask & (~is_cortex) & (~is_trab)
 
-    print(f"Total trabecular voxels: {int(is_trab.sum())}")
+        fill_to_cortex = unassigned & band & solid_bool
+        fill_to_trab = unassigned & (~band)
+
+        is_cortex[fill_to_cortex] = True
+        is_trab[fill_to_trab] = True
+
+        print(f"Unassigned bone voxels before fill: {int(unassigned.sum())}")
+        print(f"Filled to cortex (inside band): {int(fill_to_cortex.sum())}")
+        print(f"Filled to trabecula (outside band): {int(fill_to_trab.sum())}")
+
+    print(f"Cortex voxels after optional fill: {int(is_cortex.sum())}")
+    print(f"Trabecular voxels after optional fill: {int(is_trab.sum())}")
 
     # ============================================================================
-    # STEP 5: Remove periosteal (outside solid blob) cortex
+    # STEP 4: Remove periosteal cortex
     # ============================================================================
     print("\n--- Removing periosteal cortex ---")
     periosteal_side = ~solid_bool
+    removed_periosteal = int((is_cortex & periosteal_side).sum())
     is_cortex[periosteal_side] = False
 
-    # Recompute trabecula after removing periosteal cortex
-    is_trab = bone_mask & (~is_cortex)
+    trab_inside_band_not_cortex = is_high_trab_density & band & (~is_cortex)
+    is_trab = trab_outside_band | trab_inside_band_not_cortex
+
+    if fill_unassigned:
+        unassigned = bone_mask & (~is_cortex) & (~is_trab)
+        fill_to_cortex = unassigned & band & solid_bool
+        fill_to_trab = unassigned & (~band)
+
+        is_cortex[fill_to_cortex] = True
+        is_trab[fill_to_trab] = True
+
+        print(f"Periosteal cortex removed: {removed_periosteal}")
+        print(f"Re-filled to cortex (inside band): {int(fill_to_cortex.sum())}")
+        print(f"Re-filled to trabecula (outside band): {int(fill_to_trab.sum())}")
 
     print(f"Cortex voxels (after periosteal removal): {int(is_cortex.sum())}")
     print(f"Trabecular voxels (after periosteal removal): {int(is_trab.sum())}")
 
     # ============================================================================
-    # STEP 6: Conservative cleanup (preserve trabecular structure in band)
+    # STEP 5: Conservative cleanup
     # ============================================================================
     print("\n=== Tissue cleanup (conservative) ===")
     struct_6 = ndi.generate_binary_structure(3, 1)
-    z, y, x = mg.shape
 
-    print("--- Cortical cleanup: mild morphology (no aggressive closing) ---")
-    # Light opening: remove only very small noise, preserve main structure
-    cortex_clean = ndi.binary_opening(is_cortex, structure=struct_6)
+    print("--- Cortical cleanup: preserve shell thickness ---")
+    cortex_clean = is_cortex.copy()
 
-    # Preserve cortical end slices if they contain cortex
-    if z > 0:
-        if cortex_clean[0].sum() == 0 and is_cortex[0].sum() > 0:
-            cortex_clean[0] = ndi.binary_opening(is_cortex[0])
-        if cortex_clean[-1].sum() == 0 and is_cortex[-1].sum() > 0:
-            cortex_clean[-1] = ndi.binary_opening(is_cortex[-1])
-
-    # Remove only VERY small cortical debris (keep structure)
     labeled_cort, n_cort = ndi.label(cortex_clean, structure=struct_6)
     if n_cort > 0:
         sizes = np.bincount(labeled_cort.ravel())
@@ -289,16 +301,17 @@ def run_script_03(
         keep_labels = np.where(sizes >= min_cortex_voxels)[0]
         cortex_clean = np.isin(labeled_cort, keep_labels)
 
+    cortex_clean &= band
+    cortex_clean &= solid_bool
+
     print(f"Cortical voxels (after cleanup): {int(cortex_clean.sum())}")
 
     print("--- Trabecular cleanup: light opening (preserve trabeculae in band) ---")
-    # Very light opening for trabecula - just remove absolute noise
     trab_clean = ndi.binary_opening(is_trab, structure=struct_6)
-
     print(f"Trabecular voxels (after cleanup): {int(trab_clean.sum())}")
 
     # ============================================================================
-    # STEP 6b: Remove small trabecular speckles in the cortex (keep only main medullary space)
+    # STEP 5b: Remove small trabecular speckles in the cortex
     # ============================================================================
     print("\n--- Removing small trabecular speckles in the cortex ---")
     trab_labels, n_trab = ndi.label(trab_clean, structure=struct_6)
@@ -306,89 +319,67 @@ def run_script_03(
     sizes[0] = 0
 
     if n_trab > 0:
-        # Find the largest trabecular cluster (assumed to be the medullary space)
         largest_trab_label = np.argmax(sizes)
-        main_trab = trab_labels == largest_trab_label
 
-        # Minimum size threshold for trabecular clusters to keep (in voxels)
-        # Adjust this value based on your data - smaller = keep more, larger = faster
-
-        # Identify small cluster labels efficiently (vectorized)
         small_cluster_labels = np.where((sizes > 0) & (sizes < min_trab_cluster_size))[0]
         small_cluster_labels = small_cluster_labels[small_cluster_labels != largest_trab_label]
 
         if small_cluster_labels.size > 0:
-            # Create a single mask for all small clusters (one operation, not looping)
             small_trab_mask = np.isin(trab_labels, small_cluster_labels)
-
-            # Reassign small clusters in the band to cortex (vectorized)
-            cortex_clean[small_trab_mask & band] = True
-
-            # Remove all small clusters from trabecular (vectorized)
+            cortex_clean[small_trab_mask & band & solid_bool] = True
             trab_clean[small_trab_mask] = False
 
     print(f"Trabecular voxels after speckle removal: {int(trab_clean.sum())}")
     print(f"Cortical voxels after speckle removal: {int(cortex_clean.sum())}")
 
     # ============================================================================
-    # STEP 6c: Aggressive removal of isolated trabecular voxels in cortical band
+    # STEP 5c: Remove isolated trabecular voxels in cortical band
     # ============================================================================
     print("\n--- Removing isolated trabecular voxels in cortical band ---")
 
     trab_in_band = trab_clean & band
 
     if trab_in_band.sum() > 0:
-        # Label all remaining trabecular voxels in the band
         trab_band_labels, n_trab_band = ndi.label(trab_in_band, structure=struct_6)
 
         if n_trab_band > 0:
             sizes_in_band = np.bincount(trab_band_labels.ravel())
-
-            # Identify tiny/isolated clusters to remove
+            sizes_in_band[0] = 0
             tiny_band_labels = np.where((sizes_in_band > 0) & (sizes_in_band < min_band_trab_size))[0]
 
             if tiny_band_labels.size > 0:
-                # Create mask for all tiny clusters
                 tiny_band_mask = np.isin(trab_band_labels, tiny_band_labels)
-
-                # Remove from trabecular, reassign to cortex
                 trab_clean[tiny_band_mask] = False
-                cortex_clean[tiny_band_mask] = True
+                cortex_clean[tiny_band_mask & solid_bool] = True
 
                 removed_count = int(tiny_band_mask.sum())
                 print(f"Removed {removed_count} isolated trabecular voxels from band")
 
     # ============================================================================
-    # STEP 6d: Remove trabecular in band NOT connected to main medullary space
+    # STEP 5d: Remove trabecular in band NOT connected to main medullary space
     # ============================================================================
     print("\n--- Removing unconnected trabecular in cortical band ---")
 
-    # Identify the main medullary trabecular space (largest cluster)
     trab_labels_all, n_trab_all = ndi.label(trab_clean, structure=struct_6)
     sizes_all = np.bincount(trab_labels_all.ravel())
-    sizes_all[0] = 0
+    if sizes_all.size > 0:
+        sizes_all[0] = 0
 
     if n_trab_all > 0:
-        # Find largest trabecular cluster (the real medullary space)
         largest_trab_label = np.argmax(sizes_all)
         main_medullary = trab_labels_all == largest_trab_label
 
-        # Dilate the main medullary space to define "connected to medullary"
-        # This allows some tolerance for connectivity
         struct_dilate = ndi.generate_binary_structure(3, 1)
-        medullary_dilated = ndi.binary_dilation(main_medullary, structure=struct_dilate, iterations=medullary_dilation_iterations)
+        medullary_dilated = ndi.binary_dilation(
+            main_medullary,
+            structure=struct_dilate,
+            iterations=medullary_dilation_iterations
+        )
 
-
-        # Get trabecular in the band
         trab_in_band = trab_clean & band
-
-        # Find which trabecular in band is connected to (dilated) medullary space
         connected_to_medullary = trab_in_band & medullary_dilated
-
-        # Remove trabecular in band that is NOT connected to medullary
         unconnected_in_band = trab_in_band & (~medullary_dilated)
 
-        # Remove unconnected structures
         trab_clean[unconnected_in_band] = False
 
         removed_unconnected = int(unconnected_in_band.sum())
@@ -398,16 +389,14 @@ def run_script_03(
     print(f"Trabecular voxels after medullary connectivity filter: {int(trab_clean.sum())}")
 
     # ============================================================================
-    # STEP 7: Identify and preserve intracortical pores
+    # STEP 6: Identify and preserve intracortical pores
     # ============================================================================
-
     print("\n=== Intracortical pore detection ===")
     void_inside = solid_bool & (~bone_mask)
     void_labels, n_void = ndi.label(void_inside, structure=struct_6)
 
     intracortical_pores = np.zeros_like(void_inside, dtype=bool)
     if n_void > 0:
-        # Border voxels for voids (touching volume boundary)
         border_mask = np.zeros_like(void_inside, dtype=bool)
         border_mask[0, :, :] |= void_inside[0, :, :]
         border_mask[-1, :, :] |= void_inside[-1, :, :]
@@ -421,19 +410,14 @@ def run_script_03(
         pore_labels = np.setdiff1d(all_labels, border_labels)
 
         if pore_labels.size > 0:
-
-            # Calculate sizes for all pores using ndi.sum
             sizes = ndi.sum(
                 void_inside.astype(np.uint8),
                 void_labels,
                 index=pore_labels,
             )
 
-            # Keep only pores above minimum size
             keep = pore_labels[np.array(sizes) >= pore_min_size]
 
-            # Create intracortical pores mask using loop (memory-efficient)
-            # instead of np.isin() which allocates huge temporary arrays
             intracortical_pores = np.zeros_like(void_inside, dtype=bool)
             if keep.size > 0:
                 for pore_label in keep:
@@ -441,7 +425,6 @@ def run_script_03(
 
     print(f"Intracortical pore voxels detected: {int(intracortical_pores.sum())}")
 
-    # Ensure pores remain empty
     cortex_clean[intracortical_pores] = False
     trab_clean[intracortical_pores] = False
 
@@ -456,11 +439,10 @@ def run_script_03(
         print("WARNING: no trabecular voxels detected.")
 
     # ============================================================================
-    # STEP 7b: Keep only largest connected island for cortex and trabecula
+    # STEP 6b: Keep only largest connected island for cortex and trabecula
     # ============================================================================
     print("\n=== Keeping only largest connected islands ===")
 
-    # Keep only largest cortical island
     if cortex_clean.sum() > 0:
         cortex_labels, n_cortex = ndi.label(cortex_clean, structure=struct_6)
         if n_cortex > 0:
@@ -473,7 +455,6 @@ def run_script_03(
             removed_cortex = cortex_before - cortex_after
             print(f"Cortex: kept largest island ({cortex_after} voxels), removed {removed_cortex} isolated voxels")
 
-    # Keep only largest trabecular island
     if trab_clean.sum() > 0:
         trab_labels_final, n_trab = ndi.label(trab_clean, structure=struct_6)
         if n_trab > 0:
@@ -489,9 +470,8 @@ def run_script_03(
     print(f"\nCortical voxels (largest island only): {int(cortex_clean.sum())}")
     print(f"Trabecular voxels (largest island only): {int(trab_clean.sum())}")
 
-
     # ============================================================================
-    # STEP 8: Save outputs
+    # STEP 7: Save outputs
     # ============================================================================
     cortex_u8 = cortex_clean.astype(np.uint8) * 255
     trab_u8 = trab_clean.astype(np.uint8) * 255
@@ -499,7 +479,6 @@ def run_script_03(
     cortex_path = out_dir / f"{specimen_id}_cortical_mask_final.tiff"
     trab_path = out_dir / f"{specimen_id}_trabecular_mask_final.tiff"
 
-    # Delete existing files to ensure overwrite
     import os
     if cortex_path.exists():
         os.remove(cortex_path)
@@ -523,7 +502,7 @@ def run_script_03(
         imwrite(str(label_path), labels)
 
     # ============================================================================
-    # STEP 9: Save comprehensive parameters summary
+    # STEP 8: Save comprehensive parameters summary
     # ============================================================================
     band_voxels = int(band.sum())
     bone_mask_voxels = int(bone_mask.sum())
@@ -542,21 +521,20 @@ def run_script_03(
         "medullary_dilation_iterations": medullary_dilation_iterations,
         "min_cortex_voxels": min_cortex_voxels,
         "pore_min_size": pore_min_size,
+        "fill_unassigned": fill_unassigned,
         "write_label_volume": WRITE_LABEL_VOLUME,
         "band_voxels": band_voxels,
         "bone_mask_voxels": bone_mask_voxels,
         "cortex_voxels_final": cortex_voxels_final,
         "trab_voxels_final": trab_voxels_final,
         "intracortical_pore_voxels": int(intracortical_pores.sum()),
-        "method": "density-based + connectivity-filtered + medullary connectivity",
+        "method": "cortex-first assignment + optional fill + preserved cortical shell + medullary connectivity",
     }
 
-    # Save as JSON
     json_path = out_dir / f"{specimen_id}_segmentation_params.json"
     with open(json_path, "w") as f:
         json.dump(all_parameters, f, indent=2)
 
-    # Save as comprehensive parameters table (TXT format)
     params_table_path = out_dir / f"{specimen_id}_parameters_used.txt"
     with open(params_table_path, "w") as f:
         f.write("=" * 80 + "\n")
@@ -572,19 +550,20 @@ def run_script_03(
         f.write("METHOD DESCRIPTION:\n")
         f.write("=" * 80 + "\n")
         f.write("This segmentation uses density-based classification combined with:\n")
-        f.write("1. Connectivity filtering to identify main cortical shell\n")
-        f.write("2. Medullary connectivity to remove isolated trabecular artifacts\n")
-        f.write("3. Periosteal edge cleaning to remove resolution artifacts\n")
+        f.write("1. Cortex assigned first inside cortical band only\n")
+        f.write("2. Trabecula assigned from trabecular-density voxels outside band plus inside-band non-cortex voxels\n")
+        f.write("3. Optional fill of unassigned voxels by geometry\n")
+        f.write("4. Cortical shell preserved without binary opening\n")
+        f.write("5. Medullary connectivity to remove isolated trabecular artifacts\n")
+        f.write("6. Periosteal edge cleaning to remove resolution artifacts\n")
         f.write("=" * 80 + "\n")
 
-    # Save as simple TSV table (easier to import into Excel/Calc)
     params_tsv_path = out_dir / f"{specimen_id}_parameters_used.tsv"
     with open(params_tsv_path, "w") as f:
         f.write("Parameter_Name\tValue\n")
         for param_name, param_value in all_parameters.items():
             f.write(f"{param_name}\t{param_value}\n")
 
-    # Also save the old format for backwards compatibility
     txt_path = out_dir / f"{specimen_id}_segmentation_params.txt"
     with open(txt_path, "w") as f:
         f.write(
@@ -594,6 +573,7 @@ def run_script_03(
             "trab_min_mgha\t"
             "cort_min_mgha\t"
             "cort_max_mgha\t"
+            "fill_unassigned\t"
             "band_voxels\t"
             "bone_mask_voxels\t"
             "cortex_voxels_final\t"
@@ -608,12 +588,13 @@ def run_script_03(
             f"{trab_min:.3f}\t"
             f"{cort_min:.3f}\t"
             f"{cort_max:.3f}\t"
+            f"{fill_unassigned}\t"
             f"{band_voxels}\t"
             f"{bone_mask_voxels}\t"
             f"{cortex_voxels_final}\t"
             f"{trab_voxels_final}\t"
             f"{int(intracortical_pores.sum())}\t"
-            f"density-based + connectivity-filtered + medullary connectivity\n"
+            f"cortex-first assignment + optional fill + preserved cortical shell + medullary connectivity\n"
         )
 
     print(f"Saved JSON parameters to: {json_path}")
@@ -621,4 +602,3 @@ def run_script_03(
     print(f"Saved TSV parameters to: {params_tsv_path}")
     print(f"Saved segmentation params to: {txt_path}")
     print("=== Script 03 complete ===")
-
