@@ -48,9 +48,9 @@ BASE_DEV = Path(r"C:\Users\jeichwal\Documents\A_DocTech\P1_Segmentation\Data")
 
 SPECIMEN_BASES = [
     #"23162R&L",
-    "23167R&L",
-    "23168R&L",
-    "23169R&L",
+    #"23167R&L",
+    #"23168R&L",
+    #"23169R&L",
     "23170R&L",
     "23175R&L",
 ]
